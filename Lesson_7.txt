@@ -1,0 +1,163 @@
+# Написать программу, которая собирает входящие письма из своего или тестового почтового ящика
+# и сложить данные о письмах в базу данных (от кого, дата отправки, тема письма, текст письма полный)
+# Логин тестового ящика: study.ai_172@mail.ru
+# Пароль тестового ящика: NewPassword172
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import Select
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.action_chains import ActionChains
+from pymongo import MongoClient
+import time
+
+
+def authorization():
+    login = 'study.ai_172@mail.ru'
+    password = 'NewPassword172'
+
+    driver = webdriver.Chrome()
+    driver.maximize_window()
+    driver.get('https://mail.ru/')
+
+    name = driver.find_element_by_xpath("//input[@id='mailbox:login']")
+    name.send_keys(login.split('@')[0])
+
+    domain = driver.find_element_by_xpath("//select[@id='mailbox:domain']")
+    options = domain.find_elements_by_tag_name('option')
+    s = '@' + login.split('@')[1]
+    for option in options:
+        if option.text == s:
+            select = Select(domain)
+            select.select_by_visible_text(s)
+            option.submit()
+
+    password_input = driver.find_element_by_xpath("//input[@id='mailbox:password']")
+    password_input.send_keys(password)
+    password_input.submit()
+
+    letters = WebDriverWait(driver, 10).until(EC.presence_of_all_elements_located((By.XPATH,
+        "//a[@class='llc js-tooltip-direction_letter-bottom js-letter-list-item llc_pony-mode llc_normal']")))
+    assert 'Входящие - Почта Mail.ru' in driver.title
+
+    return letters, driver
+
+
+def scroll(letters, driver):
+    action = ActionChains(driver)
+    action.move_to_element(letters[-1])
+    action.perform()
+    letters = driver.find_elements_by_xpath(
+        ".//a[@class='llc js-tooltip-direction_letter-bottom js-letter-list-item llc_pony-mode llc_normal']")
+    return letters, driver
+
+
+if __name__ == '__main__':
+    letters, driver = authorization()
+    letters, driver = scroll(letters, driver)
+
+    db = {}
+    n = 0
+    href = []
+    for letter in letters:
+        df = {}
+        df['author'] = letter.find_element_by_xpath(".//span[@class='ll-crpt']").text
+        df['Re'] = letter.find_element_by_xpath(".//span[@class='ll-sj__normal']").text
+        df['date'] = letter.find_element_by_xpath(".//div[@class='llc__item llc__item_date']").text
+        href.append(letter.get_attribute('href'))
+        db[n] = df
+        n += 1
+    for i in range(n):
+        driver.get(href[i])
+        content = WebDriverWait(driver, 10). \
+            until(EC.presence_of_all_elements_located((By.XPATH,
+                                                       ".//div[@class='letter-body__body']")))
+        assert 'Почта Mail.ru' in driver.title
+        db[i]['text'] = content[0].text
+        driver.back()
+        time.sleep(5)
+        assert 'Входящие - Почта Mail.ru' in driver.title
+    driver.quit()
+
+    client = MongoClient('localhost', 27017)
+    mail = client['mail']
+    db_list = []
+    for i in db:
+        db_list.append(db[i])
+    mail.letters.insert_many([i for i in db_list])
+
+#Написать программу, которая собирает «Хиты продаж» с сайта техники mvideo и складывает данные в БД. Магазины можно выбрать свои.
+#Главный критерий выбора: динамически загружаемые товары
+
+from selenium import webdriver
+from pymongo import MongoClient
+from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+from selenium.common import exceptions
+
+MONGO_URI = 'mongodb://172.17.0.2:27017/'
+MONGO_DATABASE = 'mvideo_db'
+
+client = MongoClient(MONGO_URI)
+mongo_base = client[MONGO_DATABASE]
+collection = mongo_base['bestsellers']
+
+firefox_options = Options()
+firefox_options.add_argument("--headless")
+
+driver = webdriver.Firefox(options=firefox_options)
+
+url = 'https://www.mvideo.ru'
+title_site = 'М.Видео'
+
+driver.get(url)
+
+assert title_site in driver.title
+
+try:
+    bestsellers = driver.find_element_by_xpath(
+        '//div[contains(text(),"Хиты продаж")]/ancestor::div[@data-init="gtm-push-products"]'
+    )
+except exceptions.NoSuchElementException:
+    print('Bestsellers has not been found')
+
+while True:
+    try:
+        next_button = WebDriverWait(bestsellers, 5).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, 'a[class="next-btn sel-hits-button-next"]')
+            )
+        )
+
+        driver.execute_script("$(arguments[0]).click();", next_button)
+    except exceptions.TimeoutException:
+        print('Сбор данных окончен')
+        break
+
+goods = bestsellers.find_elements_by_css_selector('li.gallery-list-item')
+
+item = {}
+for good in goods:
+    item['title'] = good.find_element_by_css_selector(
+        'a.sel-product-tile-title') \
+        .get_attribute('innerHTML')
+
+    item['good_link'] = good.find_element_by_css_selector(
+        'a.sel-product-tile-title') \
+        .get_attribute('href')
+
+    item['price'] = float(
+        good.find_element_by_css_selector(
+            'div.c-pdp-price__current').get_attribute('innerHTML').replace(
+                '&nbsp;', '').replace('¤', ''))
+
+    item['image_link'] = good.find_element_by_css_selector(
+        'img[class="lazy product-tile-picture__image"]') \
+        .get_attribute('src')
+
+    collection.update_one({'good_link': item['good_link']}, {'$set': item},
+                          upsert=True)
+driver.quit()
